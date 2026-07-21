@@ -1,21 +1,18 @@
 import { Telegraf } from "telegraf";
-import * as fs from "fs";
 import {
   extractUrl,
   getPlatformName,
-  getCobaltUrl,
-  getYtdlpDirectUrl,
-  downloadToFile,
-  deleteFile,
+  getVideoUrl,
+  fetchAsStream,
 } from "./downloader";
 
 export function createBot(token: string): Telegraf {
-  const bot = new Telegraf(token);
+  const bot = new Telegraf(token, { handlerTimeout: 90_000 });
 
   bot.start((ctx) =>
     ctx.reply(
-      "👋 أهلاً! أرسل لي رابط مقطع من أي منصة وأحمّله لك بدون علامة مائية ⚡\n\n" +
-        "يدعم: تيك توك · إنستغرام · يوتيوب · تويتر · فيسبوك · سناب · ريدت · وأكثر"
+      "👋 أهلاً! أرسل رابط مقطع من أي منصة وأرسله لك بدون علامة مائية ⚡\n\n" +
+        "تيك توك · إنستغرام · يوتيوب · تويتر · فيسبوك · سناب · ريدت · وأكثر"
     )
   );
 
@@ -23,17 +20,15 @@ export function createBot(token: string): Telegraf {
     ctx.reply(
       "🎬 *المنصات المدعومة:*\n\n" +
         "• TikTok — بدون علامة مائية\n" +
-        "• Instagram — Reels & Posts\n" +
-        "• YouTube — Shorts & Videos\n" +
+        "• Instagram Reels & Posts\n" +
+        "• YouTube Shorts & Videos\n" +
         "• Twitter / X\n" +
         "• Facebook\n" +
         "• Snapchat\n" +
         "• Reddit\n" +
         "• Pinterest\n" +
         "• Twitch Clips\n" +
-        "• Vimeo\n" +
-        "• Dailymotion\n" +
-        "• وأكثر...\n\n" +
+        "• Vimeo · Dailymotion\n\n" +
         "📌 فقط أرسل الرابط مباشرة!",
       { parse_mode: "Markdown" }
     )
@@ -45,51 +40,37 @@ export function createBot(token: string): Telegraf {
 
     const platform = getPlatformName(url);
 
-    // ── 1st: Cobalt API (~300-500ms) — fastest, no download needed ──
+    let videoUrl: string | null = null;
     try {
-      const cobaltUrl = await getCobaltUrl(url);
-      if (cobaltUrl) {
-        await ctx.replyWithVideo(cobaltUrl, { caption: `✅ ${platform}` });
-        return;
-      }
-    } catch { /* fall through */ }
+      videoUrl = await getVideoUrl(url);
+    } catch {
+      await ctx.reply("❌ تعذّر التحميل، تأكد أن الحساب عام والرابط صحيح.");
+      return;
+    }
 
-    // ── 2nd: yt-dlp -g (direct url, ~2s) — no server download ───────
-    const waitMsg = await ctx.reply("⬇️");
-    try {
-      const directUrl = await getYtdlpDirectUrl(url);
-      if (directUrl) {
-        await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
-        await ctx.replyWithVideo(directUrl, { caption: `✅ ${platform}` });
-        return;
-      }
-    } catch { /* fall through */ }
+    if (!videoUrl) {
+      await ctx.reply("❌ تعذّر التحميل، تأكد أن الحساب عام والرابط صحيح.");
+      return;
+    }
 
-    // ── 3rd: download file to server then upload (slowest fallback) ──
-    let filePath: string | undefined;
+    // ── Try sending URL directly (Telegram fetches from CDN — fastest) ──
     try {
-      const result = await downloadToFile(url);
-      if (!result) {
-        await ctx.telegram
-          .editMessageText(ctx.chat.id, waitMsg.message_id, undefined,
-            "❌ تعذّر التحميل، تأكد أن الحساب عام والرابط صحيح.")
-          .catch(() => {});
-        return;
-      }
-      filePath = result.filePath;
-      await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+      await ctx.replyWithVideo(videoUrl, { caption: `✅ ${platform}` });
+      return;
+    } catch {
+      // URL didn't work → stream the video through our server
+    }
+
+    // ── Stream from CDN → Telegram directly (no temp file, no disk I/O) ──
+    try {
+      const stream = await fetchAsStream(videoUrl);
       await ctx.replyWithVideo(
-        { source: fs.createReadStream(filePath) },
+        { source: stream },
         { caption: `✅ ${platform}` }
       );
     } catch (err: unknown) {
-      console.error("Bot error:", err instanceof Error ? err.message : err);
-      await ctx.telegram
-        .editMessageText(ctx.chat.id, waitMsg.message_id, undefined,
-          "❌ خطأ في التحميل، حاول مجددًا.")
-        .catch(() => {});
-    } finally {
-      if (filePath) deleteFile(filePath);
+      console.error("Stream error:", err instanceof Error ? err.message : err);
+      await ctx.reply("❌ خطأ في التحميل، حاول مجددًا.");
     }
   });
 

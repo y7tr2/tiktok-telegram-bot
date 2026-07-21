@@ -1,14 +1,8 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
-import * as path from "path";
-import * as fs from "fs";
-import * as crypto from "crypto";
-import * as os from "os";
+import { Readable } from "stream";
 
 const execFileAsync = promisify(execFile);
-
-const TMP_DIR = path.join(os.tmpdir(), "tg-bot-dl");
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 const SUPPORTED_DOMAINS = [
   "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
@@ -16,20 +10,15 @@ const SUPPORTED_DOMAINS = [
   "youtube.com", "youtu.be",
   "twitter.com", "x.com", "t.co",
   "facebook.com", "fb.watch", "fb.com", "m.facebook.com",
-  "snapchat.com",
-  "pinterest.com", "pin.it",
+  "snapchat.com", "pinterest.com", "pin.it",
   "reddit.com", "v.redd.it", "redd.it",
   "twitch.tv", "clips.twitch.tv",
-  "vimeo.com",
-  "dailymotion.com", "dai.ly",
-  "linkedin.com",
-  "bilibili.com",
-  "kwai.com",
+  "vimeo.com", "dailymotion.com", "dai.ly",
+  "linkedin.com", "bilibili.com", "kwai.com",
 ];
 
 export function extractUrl(text: string): string | null {
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
-  const matches = text.match(urlRegex);
+  const matches = text.match(/(https?:\/\/[^\s]+)/g);
   if (!matches) return null;
   for (const url of matches) {
     try {
@@ -54,22 +43,34 @@ export function getPlatformName(url: string): string {
     if (hostname.includes("twitch")) return "Twitch";
     if (hostname.includes("vimeo")) return "Vimeo";
     if (hostname.includes("dailymotion") || hostname.includes("dai.ly")) return "Dailymotion";
-    if (hostname.includes("linkedin")) return "LinkedIn";
-    if (hostname.includes("bilibili")) return "Bilibili";
-    if (hostname.includes("kwai")) return "Kwai";
   } catch { /* ignore */ }
   return "Video";
 }
 
-// ── 1st ATTEMPT: Cobalt API — returns direct url in ~300-500ms ────────────────
-// No yt-dlp, no download, just a fast API call then Telegram fetches from CDN.
-interface CobaltResponse {
-  status: "redirect" | "tunnel" | "picker" | "error";
-  url?: string;
-  picker?: Array<{ url: string; type: string }>;
+// ── 1. tikwm.com — fastest TikTok API (~200ms) ───────────────────────────────
+async function tikwmUrl(url: string): Promise<string | null> {
+  try {
+    const body = new URLSearchParams({ url, hd: "1" });
+    const res = await fetch("https://www.tikwm.com/api/", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      signal: AbortSignal.timeout(6_000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      code: number;
+      data?: { hdplay?: string; play?: string };
+    };
+    if (json.code !== 0 || !json.data) return null;
+    return json.data.hdplay || json.data.play || null;
+  } catch {
+    return null;
+  }
 }
 
-export async function getCobaltUrl(url: string): Promise<string | null> {
+// ── 2. Cobalt API — supports all other platforms ─────────────────────────────
+async function cobaltUrl(url: string): Promise<string | null> {
   try {
     const res = await fetch("https://api.cobalt.tools/", {
       method: "POST",
@@ -78,51 +79,35 @@ export async function getCobaltUrl(url: string): Promise<string | null> {
         Accept: "application/json",
         "User-Agent": "tg-bot/1.0",
       },
-      body: JSON.stringify({
-        url,
-        videoQuality: "720",
-        filenameStyle: "basic",
-        downloadMode: "auto",
-      }),
-      signal: AbortSignal.timeout(8_000),
+      body: JSON.stringify({ url, videoQuality: "720", filenameStyle: "basic", downloadMode: "auto" }),
+      signal: AbortSignal.timeout(7_000),
     });
-
     if (!res.ok) return null;
-
-    const data = (await res.json()) as CobaltResponse;
-
-    if ((data.status === "redirect" || data.status === "tunnel") && data.url) {
-      return data.url;
-    }
-
-    // Instagram / multi-media picker → return first video
+    const data = (await res.json()) as {
+      status: string; url?: string;
+      picker?: Array<{ url: string; type: string }>;
+    };
+    if ((data.status === "redirect" || data.status === "tunnel") && data.url) return data.url;
     if (data.status === "picker" && data.picker) {
-      const video = data.picker.find((p) => p.type === "video") ?? data.picker[0];
-      return video?.url ?? null;
+      const v = data.picker.find((p) => p.type === "video") ?? data.picker[0];
+      return v?.url ?? null;
     }
-
     return null;
   } catch {
     return null;
   }
 }
 
-// ── 2nd ATTEMPT: yt-dlp -g — extract direct url, no download ────────────────
-export async function getYtdlpDirectUrl(url: string): Promise<string | null> {
+// ── 3. yt-dlp -g — direct url extraction, no download ───────────────────────
+async function ytdlpDirectUrl(url: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      "yt-dlp",
-      [
-        "--no-playlist", "-g",
-        "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
-        "--no-warnings", "--no-check-certificates",
-        "--socket-timeout", "8",
-        "--extractor-retries", "1",
-        "--retries", "1",
-        url,
-      ],
-      { timeout: 15_000 }
-    );
+    const { stdout } = await execFileAsync("yt-dlp", [
+      "--no-playlist", "-g",
+      "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
+      "--no-warnings", "--no-check-certificates",
+      "--socket-timeout", "8", "--extractor-retries", "1", "--retries", "1",
+      url,
+    ], { timeout: 15_000 });
     const first = stdout.trim().split("\n")[0] ?? "";
     return first.startsWith("http") ? first : null;
   } catch {
@@ -130,37 +115,37 @@ export async function getYtdlpDirectUrl(url: string): Promise<string | null> {
   }
 }
 
-// ── 3rd ATTEMPT (last resort): download to disk then upload ─────────────────
-export async function downloadToFile(
-  url: string
-): Promise<{ filePath: string } | null> {
-  const id = crypto.randomBytes(8).toString("hex");
-  const outputTemplate = path.join(TMP_DIR, `${id}.%(ext)s`);
+// ── Main: try all sources, return the first working direct url ───────────────
+export async function getVideoUrl(url: string): Promise<string | null> {
+  const isTikTok = url.includes("tiktok.com") || url.includes("vm.tiktok") || url.includes("vt.tiktok");
 
-  await execFileAsync(
-    "yt-dlp",
-    [
-      "--no-playlist",
-      "--max-filesize", "49m",
-      "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
-      "--no-warnings", "-q",
-      "--no-check-certificates",
-      "--concurrent-fragments", "16",
-      "--buffer-size", "1M",
-      "--no-part",
-      "--retries", "2",
-      "--socket-timeout", "10",
-      "-o", outputTemplate,
-      url,
-    ],
-    { timeout: 60_000 }
-  );
+  if (isTikTok) {
+    // Race tikwm vs cobalt for TikTok — take whichever is faster
+    const [tkUrl, cbUrl] = await Promise.allSettled([tikwmUrl(url), cobaltUrl(url)]);
+    const result =
+      (tkUrl.status === "fulfilled" && tkUrl.value) ||
+      (cbUrl.status === "fulfilled" && cbUrl.value) ||
+      null;
+    if (result) return result;
+  } else {
+    const cbUrl = await cobaltUrl(url);
+    if (cbUrl) return cbUrl;
+  }
 
-  const files = fs.readdirSync(TMP_DIR).filter((f) => f.startsWith(id));
-  if (files.length === 0) return null;
-  return { filePath: path.join(TMP_DIR, files[0]) };
+  // Last resort: yt-dlp
+  return ytdlpDirectUrl(url);
 }
 
-export function deleteFile(filePath: string): void {
-  try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+// ── Stream video from CDN → Node Readable (pipe directly to Telegram) ────────
+export async function fetchAsStream(videoUrl: string): Promise<Readable> {
+  const res = await fetch(videoUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+      Referer: "https://www.tiktok.com/",
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok || !res.body) throw new Error(`Fetch failed: ${res.status}`);
+  return Readable.fromWeb(res.body as import("stream/web").ReadableStream);
 }
