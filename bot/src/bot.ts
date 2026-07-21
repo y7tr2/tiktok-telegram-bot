@@ -5,6 +5,7 @@ import {
   getVideoUrl,
   fetchAsStream,
 } from "./downloader";
+import { getCached, setCached } from "./cache";
 
 export function createBot(token: string): Telegraf {
   const bot = new Telegraf(token, { handlerTimeout: 90_000 });
@@ -23,12 +24,9 @@ export function createBot(token: string): Telegraf {
         "• Instagram Reels & Posts\n" +
         "• YouTube Shorts & Videos\n" +
         "• Twitter / X\n" +
-        "• Facebook\n" +
-        "• Snapchat\n" +
-        "• Reddit\n" +
-        "• Pinterest\n" +
-        "• Twitch Clips\n" +
-        "• Vimeo · Dailymotion\n\n" +
+        "• Facebook · Snapchat\n" +
+        "• Reddit · Pinterest\n" +
+        "• Twitch · Vimeo · Dailymotion\n\n" +
         "📌 فقط أرسل الرابط مباشرة!",
       { parse_mode: "Markdown" }
     )
@@ -40,36 +38,41 @@ export function createBot(token: string): Telegraf {
 
     const platform = getPlatformName(url);
 
+    // ── 1. Cache hit: resend in ~100ms using Telegram's file_id ─────────
+    const cachedId = getCached(url);
+    if (cachedId) {
+      try {
+        await ctx.replyWithVideo(cachedId, { caption: `✅ ${platform}` });
+        return;
+      } catch {
+        // file_id expired or invalid — fall through to fresh download
+      }
+    }
+
+    // ── 2. Get direct CDN url (tikwm race + cobalt, ~200-400ms) ─────────
     let videoUrl: string | null = null;
     try {
       videoUrl = await getVideoUrl(url);
-    } catch {
-      await ctx.reply("❌ تعذّر التحميل، تأكد أن الحساب عام والرابط صحيح.");
-      return;
-    }
+    } catch { /* ignore */ }
 
     if (!videoUrl) {
       await ctx.reply("❌ تعذّر التحميل، تأكد أن الحساب عام والرابط صحيح.");
       return;
     }
 
-    // ── Try sending URL directly (Telegram fetches from CDN — fastest) ──
-    try {
-      await ctx.replyWithVideo(videoUrl, { caption: `✅ ${platform}` });
-      return;
-    } catch {
-      // URL didn't work → stream the video through our server
-    }
-
-    // ── Stream from CDN → Telegram directly (no temp file, no disk I/O) ──
+    // ── 3. Stream CDN → Telegram directly (no disk, no temp file) ───────
     try {
       const stream = await fetchAsStream(videoUrl);
-      await ctx.replyWithVideo(
-        { source: stream },
+      const sent = await ctx.replyWithVideo(
+        { source: stream, filename: "video.mp4" },
         { caption: `✅ ${platform}` }
       );
+
+      // Cache the file_id for instant resend next time
+      const fileId = sent.video?.file_id;
+      if (fileId) setCached(url, fileId);
     } catch (err: unknown) {
-      console.error("Stream error:", err instanceof Error ? err.message : err);
+      console.error("Error:", err instanceof Error ? err.message : err);
       await ctx.reply("❌ خطأ في التحميل، حاول مجددًا.");
     }
   });
