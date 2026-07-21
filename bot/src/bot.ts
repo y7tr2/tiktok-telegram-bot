@@ -60,15 +60,23 @@ export function createBot(token: string): Telegraf {
       return;
     }
 
-    // ── 3. Stream CDN → Telegram directly (no disk, no temp file) ───────
+    // ── 3. Send URL directly — Telegram fetches from CDN (no server hop) ──
+    try {
+      const sent = await ctx.replyWithVideo(videoUrl, {
+        caption: `✅ ${platform}`,
+      });
+      const fileId = sent.video?.file_id;
+      if (fileId) setCached(url, fileId);
+      return;
+    } catch { /* URL not accessible by Telegram — fallback to stream */ }
+
+    // ── 4. Last resort: stream through server ────────────────────────────
     try {
       const stream = await fetchAsStream(videoUrl);
       const sent = await ctx.replyWithVideo(
         { source: stream, filename: "video.mp4" },
         { caption: `✅ ${platform}` }
       );
-
-      // Cache the file_id for instant resend next time
       const fileId = sent.video?.file_id;
       if (fileId) setCached(url, fileId);
     } catch (err: unknown) {
