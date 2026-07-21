@@ -99,19 +99,26 @@ export async function downloadVideo(
       "--no-playlist",
       "--max-filesize",
       "49m",
-      // Prefer a single mp4 stream to avoid ffmpeg merging requirement
+      // Single-stream mp4 — no ffmpeg merge needed = faster
       "-f",
-      "best[ext=mp4][height<=720]/best[ext=mp4]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best",
-      "--merge-output-format",
-      "mp4",
+      "best[ext=mp4][height<=480]/best[ext=mp4]/best",
       "--no-warnings",
       "-q",
       "--no-check-certificates",
+      // Speed tweaks
+      "--concurrent-fragments",
+      "5",
+      "--buffer-size",
+      "16K",
+      "--http-chunk-size",
+      "10M",
+      "--socket-timeout",
+      "15",
       "-o",
       outputTemplate,
       url,
     ],
-    { timeout: 90_000 }
+    { timeout: 60_000 }
   );
 
   const files = fs.readdirSync(TMP_DIR).filter((f) => f.startsWith(id));
