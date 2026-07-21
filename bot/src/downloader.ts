@@ -115,25 +115,24 @@ async function ytdlpDirectUrl(url: string): Promise<string | null> {
   }
 }
 
-// ── Main: try all sources, return the first working direct url ───────────────
+// ── Main: race ALL sources simultaneously, return first winner ───────────────
 export async function getVideoUrl(url: string): Promise<string | null> {
-  const isTikTok = url.includes("tiktok.com") || url.includes("vm.tiktok") || url.includes("vt.tiktok");
+  // Run tikwm + cobalt in parallel for every platform — fastest wins
+  return new Promise((resolve) => {
+    let done = false;
+    let pending = 2;
 
-  if (isTikTok) {
-    // Race tikwm vs cobalt for TikTok — take whichever is faster
-    const [tkUrl, cbUrl] = await Promise.allSettled([tikwmUrl(url), cobaltUrl(url)]);
-    const result =
-      (tkUrl.status === "fulfilled" && tkUrl.value) ||
-      (cbUrl.status === "fulfilled" && cbUrl.value) ||
-      null;
-    if (result) return result;
-  } else {
-    const cbUrl = await cobaltUrl(url);
-    if (cbUrl) return cbUrl;
-  }
+    function tryResolve(val: string | null) {
+      if (val && !done) { done = true; resolve(val); }
+      else if (--pending === 0 && !done) {
+        // Both APIs failed — fall back to yt-dlp
+        ytdlpDirectUrl(url).then(resolve);
+      }
+    }
 
-  // Last resort: yt-dlp
-  return ytdlpDirectUrl(url);
+    tikwmUrl(url).then(tryResolve).catch(() => tryResolve(null));
+    cobaltUrl(url).then(tryResolve).catch(() => tryResolve(null));
+  });
 }
 
 // ── Stream video from CDN → Node Readable (pipe directly to Telegram) ────────
