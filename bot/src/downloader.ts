@@ -61,36 +61,77 @@ export function getPlatformName(url: string): string {
   return "Video";
 }
 
-// ── FAST PATH: get direct CDN url, let Telegram download it ──────────────────
-// yt-dlp -g returns the direct URL in ~1-2s without downloading anything.
-export async function getDirectUrl(
-  url: string
-): Promise<string | null> {
+// ── 1st ATTEMPT: Cobalt API — returns direct url in ~300-500ms ────────────────
+// No yt-dlp, no download, just a fast API call then Telegram fetches from CDN.
+interface CobaltResponse {
+  status: "redirect" | "tunnel" | "picker" | "error";
+  url?: string;
+  picker?: Array<{ url: string; type: string }>;
+}
+
+export async function getCobaltUrl(url: string): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      "yt-dlp",
-      [
-        "--no-playlist",
-        "-g",
-        "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--socket-timeout", "10",
-        "--extractor-retries", "1",
-        "--retries", "1",
+    const res = await fetch("https://api.cobalt.tools/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": "tg-bot/1.0",
+      },
+      body: JSON.stringify({
         url,
-      ],
-      { timeout: 20_000 }
-    );
-    const firstLine = stdout.trim().split("\n")[0] ?? "";
-    return firstLine.startsWith("http") ? firstLine : null;
+        videoQuality: "720",
+        filenameStyle: "basic",
+        downloadMode: "auto",
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as CobaltResponse;
+
+    if ((data.status === "redirect" || data.status === "tunnel") && data.url) {
+      return data.url;
+    }
+
+    // Instagram / multi-media picker → return first video
+    if (data.status === "picker" && data.picker) {
+      const video = data.picker.find((p) => p.type === "video") ?? data.picker[0];
+      return video?.url ?? null;
+    }
+
+    return null;
   } catch {
     return null;
   }
 }
 
-// ── FALLBACK: download to disk then stream to Telegram ───────────────────────
-export async function downloadVideo(
+// ── 2nd ATTEMPT: yt-dlp -g — extract direct url, no download ────────────────
+export async function getYtdlpDirectUrl(url: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "yt-dlp",
+      [
+        "--no-playlist", "-g",
+        "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
+        "--no-warnings", "--no-check-certificates",
+        "--socket-timeout", "8",
+        "--extractor-retries", "1",
+        "--retries", "1",
+        url,
+      ],
+      { timeout: 15_000 }
+    );
+    const first = stdout.trim().split("\n")[0] ?? "";
+    return first.startsWith("http") ? first : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── 3rd ATTEMPT (last resort): download to disk then upload ─────────────────
+export async function downloadToFile(
   url: string
 ): Promise<{ filePath: string } | null> {
   const id = crypto.randomBytes(8).toString("hex");
@@ -102,16 +143,13 @@ export async function downloadVideo(
       "--no-playlist",
       "--max-filesize", "49m",
       "-f", "best[ext=mp4][height<=480]/best[ext=mp4]/best",
-      "--no-warnings",
-      "-q",
+      "--no-warnings", "-q",
       "--no-check-certificates",
       "--concurrent-fragments", "16",
-      "--buffer-size",          "1M",
-      "--http-chunk-size",      "10M",
+      "--buffer-size", "1M",
       "--no-part",
-      "--retries",              "2",
-      "--fragment-retries",     "2",
-      "--socket-timeout",       "10",
+      "--retries", "2",
+      "--socket-timeout", "10",
       "-o", outputTemplate,
       url,
     ],
